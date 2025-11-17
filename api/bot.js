@@ -27,13 +27,19 @@ bot.use(async (ctx, next) => {
   
   // Check if user is blocked
   if (userData?.status === config.CONFIG.USER.STATUS.BLOCKED) {
-    await ctx.reply('❌ Your account has been blocked. Contact admin for support.');
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Try Again', 'main_menu')]
+    ]);
+    await ctx.reply('❌ Your account has been blocked. Contact admin for support.', keyboard);
     return;
   }
   
   // Check maintenance mode
   if (config.botSettings.status === config.CONFIG.BOT.STATUS.MAINTENANCE && !admin.isAdmin(ctx.from?.id)) {
-    await ctx.reply(config.botSettings.maintenance_message);
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Refresh', 'main_menu')]
+    ]);
+    await ctx.reply(config.botSettings.maintenance_message, keyboard);
     return;
   }
   
@@ -91,6 +97,20 @@ bot.command('menu', async (ctx) => {
   await showMainMenu(ctx);
 });
 
+// ==================== MAIN MENU ACTION ====================
+bot.action('main_menu', async (ctx) => {
+  await ctx.answerCbQuery('🏠 Returning to main menu...');
+  // Clear any ongoing sessions
+  ctx.session.registration = null;
+  ctx.session.withdrawal = null;
+  ctx.session.messagingUser = null;
+  ctx.session.rejectingPayment = null;
+  ctx.session.rejectingWithdrawal = null;
+  ctx.session.broadcastMode = null;
+  
+  await showMainMenu(ctx);
+});
+
 // ==================== REGISTRATION BUTTON ====================
 bot.hears('📝 Register for Classes', async (ctx) => {
   if (!ctx.userData) {
@@ -102,6 +122,28 @@ bot.hears('📝 Register for Classes', async (ctx) => {
 
 // ==================== TEXT HANDLER ====================
 bot.on('text', async (ctx) => {
+  // Handle broadcast messages
+  if (ctx.session.broadcastMode) {
+    const students = await database.getAllStudents();
+    const { successCount, failCount } = await notification.broadcastToUsers(
+      `📢 *BROADCAST MESSAGE*\n\n${ctx.message.text}`,
+      students,
+      (current, total) => {
+        console.log(`Broadcast progress: ${current}/${total}`);
+      }
+    );
+    
+    await ctx.replyWithMarkdown(
+      `✅ *Broadcast Complete!*\n\n` +
+      `✅ Successful: ${successCount}\n` +
+      `❌ Failed: ${failCount}\n` +
+      `📊 Total: ${students.length}`
+    );
+    
+    ctx.session.broadcastMode = null;
+    return;
+  }
+
   // Handle withdrawal rejection reason
   if (ctx.session.rejectingWithdrawal) {
     const withdrawalId = ctx.session.rejectingWithdrawal;
@@ -183,6 +225,42 @@ bot.on('text', async (ctx) => {
     await referral.processCBEAccountName(ctx, ctx.message.text);
     return;
   }
+
+  // Handle admin search
+  if (ctx.session.adminSearch) {
+    const searchTerm = ctx.message.text;
+    const students = await database.getAllStudents();
+    
+    const foundUsers = students.filter(student => 
+      student.telegramId.toString().includes(searchTerm) ||
+      student.juId.includes(searchTerm) ||
+      student.username?.includes(searchTerm) ||
+      student.fullName.toLowerCase().includes(searchTerm.toLowerCase())
+    );
+    
+    if (foundUsers.length === 0) {
+      await ctx.reply('❌ No students found with that search term.');
+    } else {
+      for (const user of foundUsers.slice(0, 3)) {
+        const userText = `👤 *Found Student*\n\n` +
+          `Name: ${user.fullName}\n` +
+          `Username: @${user.username || 'N/A'}\n` +
+          `JU ID: ${user.juId}\n` +
+          `Status: ${user.status}\n` +
+          `Balance: ${user.balance} ETB`;
+        
+        const keyboard = Markup.inlineKeyboard([
+          [Markup.button.callback('👀 View Profile', `view_user_${user.telegramId}`)],
+          [Markup.button.callback('🔙 Back to Search', 'admin_search_user')]
+        ]);
+        
+        await ctx.replyWithMarkdown(userText, keyboard);
+      }
+    }
+    
+    ctx.session.adminSearch = null;
+    return;
+  }
 });
 
 // ==================== CONTACT SHARING HANDLER ====================
@@ -197,24 +275,42 @@ bot.on('contact', async (ctx) => {
       `✅ Contact saved: ${session.data.contactNumber}\n\n` +
       `📝 *Registration Form - Step 3/4*\n\n` +
       `Please enter your JU ID (Format: RU1234/18):`,
-      Markup.removeKeyboard()
+      Markup.keyboard([
+        ['❌ Cancel Registration']
+      ]).resize()
     );
   }
 });
 
 // ==================== REGISTRATION BUTTON HANDLERS ====================
 bot.action('registration_home', async (ctx) => {
+  await ctx.answerCbQuery('🏠 Returning to main menu...');
   ctx.session.registration = null;
   await showMainMenu(ctx);
 });
 
 bot.action('registration_cancel', async (ctx) => {
+  await ctx.answerCbQuery('❌ Registration cancelled');
   ctx.session.registration = null;
-  await ctx.editMessageText('❌ Registration cancelled. Use /start to begin again.');
+  await ctx.editMessageText('❌ Registration cancelled. Use /start to begin again.',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+    ])
+  );
+});
+
+// Cancel registration via button
+bot.hears('❌ Cancel Registration', async (ctx) => {
+  ctx.session.registration = null;
+  await ctx.reply('❌ Registration cancelled.',
+    Markup.removeKeyboard()
+  );
+  await showMainMenu(ctx);
 });
 
 // ==================== STREAM SELECTION ====================
 bot.action(/stream_(natural|social)/, async (ctx) => {
+  await ctx.answerCbQuery();
   const stream = ctx.match[1];
   await registration.handleStreamSelection(ctx, stream);
 });
@@ -247,7 +343,13 @@ bot.hears('💰 Balance', async (ctx) => {
       `🎉 *You are eligible for withdrawal!*` : 
       `❌ Need *${needed}* more paid referrals to withdraw`);
   
-  await ctx.replyWithMarkdown(balanceText);
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('💸 Withdraw Earnings', 'withdraw_earnings')],
+    [Markup.button.callback('👥 My Referrals', 'show_referrals')],
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+  ]);
+
+  await ctx.replyWithMarkdown(balanceText, keyboard);
 });
 
 bot.command('balance', async (ctx) => {
@@ -278,6 +380,15 @@ bot.command('referrals', async (ctx) => {
   await referral.showReferralInfo(ctx);
 });
 
+bot.action('show_referrals', async (ctx) => {
+  await ctx.answerCbQuery('👥 Loading referrals...');
+  await referral.showReferralInfo(ctx);
+});
+
+bot.action('referral_stats', async (ctx) => {
+  await referral.showReferralStats(ctx);
+});
+
 // Leaderboard button
 bot.hears('🏆 Leaderboard', async (ctx) => {
   const students = await database.getAllStudents();
@@ -304,13 +415,53 @@ bot.hears('🏆 Leaderboard', async (ctx) => {
       `*Your Position:* ${currentUser.paidReferrals} paid referrals\n` +
       `*Eligible for Withdrawal:* ${currentUser.paidReferrals >= 4 ? '✅ Yes' : '❌ No'}`;
   }
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('👥 My Referrals', 'show_referrals')],
+    [Markup.button.callback('💰 My Balance', 'check_balance')],
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+  ]);
   
-  await ctx.replyWithMarkdown(leaderboardText);
+  await ctx.replyWithMarkdown(leaderboardText, keyboard);
 });
 
 // Withdraw button
 bot.hears('💸 Withdraw', async (ctx) => {
   await referral.handleWithdrawalRequest(ctx);
+});
+
+bot.action('withdraw_earnings', async (ctx) => {
+  await ctx.answerCbQuery('💸 Loading withdrawal...');
+  await referral.handleWithdrawalRequest(ctx);
+});
+
+bot.action('check_balance', async (ctx) => {
+  await ctx.answerCbQuery('💰 Checking balance...');
+  const user = await database.getUser(ctx.from.id);
+  if (!user) return;
+  
+  const balanceText = `💰 *Your Balance: ${user.balance} ETB*\n\n` +
+    `✅ Paid Referrals: ${user.paidReferrals}\n` +
+    `📊 Total Referrals: ${user.totalReferrals}`;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('💸 Withdraw', 'withdraw_earnings')],
+    [Markup.button.callback('👥 Referrals', 'show_referrals')],
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+  ]);
+  
+  await ctx.editMessageText(balanceText, keyboard);
+});
+
+// ==================== WITHDRAWAL METHODS ====================
+bot.action('withdraw_telebirr', async (ctx) => {
+  await ctx.answerCbQuery('📱 Telebirr withdrawal...');
+  await referral.handleTelebirrWithdrawal(ctx);
+});
+
+bot.action('withdraw_cbe', async (ctx) => {
+  await ctx.answerCbQuery('🏦 CBE withdrawal...');
+  await referral.handleCBEWithdrawal(ctx);
 });
 
 // ==================== ADMIN SYSTEM ====================
@@ -324,6 +475,7 @@ bot.command('admin', async (ctx) => {
 
 // ==================== ADMIN DASHBOARD BUTTONS ====================
 bot.action('admin_back', async (ctx) => {
+  await ctx.answerCbQuery('🔙 Returning to dashboard...');
   await admin.showAdminDashboard(ctx);
 });
 
@@ -333,23 +485,38 @@ bot.action('admin_refresh', async (ctx) => {
 });
 
 bot.action('admin_pending_payments', async (ctx) => {
+  await ctx.answerCbQuery('📝 Loading pending payments...');
   await admin.showPendingPayments(ctx);
 });
 
 bot.action('admin_pending_withdrawals', async (ctx) => {
+  await ctx.answerCbQuery('💸 Loading pending withdrawals...');
   await admin.showPendingWithdrawals(ctx);
 });
 
 bot.action('admin_user_management', async (ctx) => {
+  await ctx.answerCbQuery('👥 Loading user management...');
   await admin.showUserManagement(ctx);
 });
 
 bot.action('admin_bot_settings', async (ctx) => {
+  await ctx.answerCbQuery('⚙️ Loading bot settings...');
   await admin.showBotSettings(ctx);
 });
 
 bot.action('admin_export_data', async (ctx) => {
+  await ctx.answerCbQuery('📤 Loading export options...');
   await admin.showExportData(ctx);
+});
+
+bot.action('admin_analytics', async (ctx) => {
+  await ctx.answerCbQuery('📊 Loading analytics...');
+  await admin.showAnalytics(ctx);
+});
+
+bot.action('admin_broadcast', async (ctx) => {
+  await ctx.answerCbQuery('📢 Loading broadcast...');
+  await admin.showBroadcast(ctx);
 });
 
 // ==================== ADMIN EXPORT BUTTONS ====================
@@ -397,18 +564,25 @@ bot.action('admin_export_social', async (ctx) => {
 
 // ==================== ADMIN USER MANAGEMENT BUTTONS ====================
 bot.action('admin_search_user', async (ctx) => {
+  await ctx.answerCbQuery('🔍 Search student...');
   await ctx.editMessageText(
     '🔍 *Search Student*\n\n' +
     'Send me the student\'s:\n' +
     '• Telegram ID\n' +
     '• JU ID\n' +
-    '• Username (without @)\n\n' +
+    '• Username (without @)\n' +
+    '• Full Name\n\n' +
     'I\'ll find their profile.',
-    { parse_mode: 'Markdown' }
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🔙 Back to Management', 'admin_user_management')],
+      [Markup.button.callback('🏠 User Menu', 'main_menu')]
+    ])
   );
+  ctx.session.adminSearch = true;
 });
 
 bot.action('admin_list_users', async (ctx) => {
+  await ctx.answerCbQuery('📋 Loading user list...');
   const students = await database.getAllStudents();
   const recentStudents = students.slice(0, 10);
   
@@ -422,10 +596,19 @@ bot.action('admin_list_users', async (ctx) => {
   
   userList += `📊 Total Students: ${students.length}`;
   
-  await ctx.editMessageText(userList, { parse_mode: 'Markdown' });
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔙 Back to Management', 'admin_user_management')],
+    [Markup.button.callback('🏠 User Menu', 'main_menu')]
+  ]);
+  
+  await ctx.editMessageText(userList, { 
+    parse_mode: 'Markdown',
+    reply_markup: keyboard.reply_markup
+  });
 });
 
 bot.action('admin_natural_students', async (ctx) => {
+  await ctx.answerCbQuery('🔬 Loading natural science students...');
   const students = await database.getStudentsByStream('natural');
   const activeStudents = students.filter(s => s.status === 'active');
   
@@ -436,11 +619,15 @@ bot.action('admin_natural_students', async (ctx) => {
     `• Active: ${activeStudents.length} students\n` +
     `• Pending: ${students.length - activeStudents.length} students\n\n` +
     `💰 Total Balance: ${students.reduce((sum, s) => sum + s.balance, 0)} ETB`,
-    { parse_mode: 'Markdown' }
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🔙 Back to Management', 'admin_user_management')],
+      [Markup.button.callback('🏠 User Menu', 'main_menu')]
+    ])
   );
 });
 
 bot.action('admin_social_students', async (ctx) => {
+  await ctx.answerCbQuery('📚 Loading social science students...');
   const students = await database.getStudentsByStream('social');
   const activeStudents = students.filter(s => s.status === 'active');
   
@@ -451,12 +638,47 @@ bot.action('admin_social_students', async (ctx) => {
     `• Active: ${activeStudents.length} students\n` +
     `• Pending: ${students.length - activeStudents.length} students\n\n` +
     `💰 Total Balance: ${students.reduce((sum, s) => sum + s.balance, 0)} ETB`,
-    { parse_mode: 'Markdown' }
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🔙 Back to Management', 'admin_user_management')],
+      [Markup.button.callback('🏠 User Menu', 'main_menu')]
+    ])
   );
+});
+
+bot.action('admin_student_analytics', async (ctx) => {
+  await ctx.answerCbQuery('📊 Loading student analytics...');
+  const students = await database.getAllStudents();
+  
+  const totalBalance = students.reduce((sum, s) => sum + s.balance, 0);
+  const totalEarned = students.reduce((sum, s) => sum + s.totalEarned, 0);
+  const totalWithdrawn = students.reduce((sum, s) => sum + s.totalWithdrawn, 0);
+  const totalReferrals = students.reduce((sum, s) => sum + s.totalReferrals, 0);
+  const paidReferrals = students.reduce((sum, s) => sum + s.paidReferrals, 0);
+  
+  const analyticsText = `📊 *STUDENT ANALYTICS*\n\n` +
+    `💰 Financial Overview:\n` +
+    `• Total Balance: ${totalBalance} ETB\n` +
+    `• Total Earned: ${totalEarned} ETB\n` +
+    `• Total Withdrawn: ${totalWithdrawn} ETB\n\n` +
+    `👥 Referral Overview:\n` +
+    `• Total Referrals: ${totalReferrals}\n` +
+    `• Paid Referrals: ${paidReferrals}\n` +
+    `• Success Rate: ${totalReferrals > 0 ? Math.round((paidReferrals / totalReferrals) * 100) : 0}%\n\n` +
+    `📈 Performance Metrics:\n` +
+    `• Avg Balance per Student: ${Math.round(totalBalance / students.length)} ETB\n` +
+    `• Avg Referrals per Student: ${Math.round(totalReferrals / students.length)}`;
+  
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔙 Back to Management', 'admin_user_management')],
+    [Markup.button.callback('🏠 User Menu', 'main_menu')]
+  ]);
+  
+  await ctx.editMessageText(analyticsText, keyboard);
 });
 
 // ==================== ADMIN BOT SETTINGS BUTTONS ====================
 bot.action('admin_toggle_bot_status', async (ctx) => {
+  await ctx.answerCbQuery('🔄 Toggling bot status...');
   const { botSettings, CONFIG } = require('../lib/config');
   
   if (botSettings.status === CONFIG.BOT.STATUS.ACTIVE) {
@@ -464,14 +686,22 @@ bot.action('admin_toggle_bot_status', async (ctx) => {
     await ctx.editMessageText(
       '🔴 *Maintenance Mode Activated*\n\n' +
       'Bot is now in maintenance mode. Only admins can access it.',
-      { parse_mode: 'Markdown' }
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🟢 Activate Bot', 'admin_toggle_bot_status')],
+        [Markup.button.callback('🔙 Back to Settings', 'admin_bot_settings')],
+        [Markup.button.callback('🏠 User Menu', 'main_menu')]
+      ])
     );
   } else {
     botSettings.status = CONFIG.BOT.STATUS.ACTIVE;
     await ctx.editMessageText(
       '🟢 *Bot Activated*\n\n' +
       'Bot is now active and accessible to all users.',
-      { parse_mode: 'Markdown' }
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🔴 Maintenance Mode', 'admin_toggle_bot_status')],
+        [Markup.button.callback('🔙 Back to Settings', 'admin_bot_settings')],
+        [Markup.button.callback('🏠 User Menu', 'main_menu')]
+      ])
     );
   }
 });
@@ -497,7 +727,13 @@ bot.action(/block_user_(.+)/, async (ctx) => {
     });
     
     await notification.notifyUserBlocked(userId, 'Manual block by admin');
-    await ctx.editMessageText(`✅ User ${user.fullName} has been blocked.`);
+    await ctx.editMessageText(`✅ User ${user.fullName} has been blocked.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Unblock User', `approve_user_${userId}`)],
+        [Markup.button.callback('🔙 Back to User', `view_user_${userId}`)],
+        [Markup.button.callback('🏠 User Menu', 'main_menu')]
+      ])
+    );
   } else {
     await ctx.answerCbQuery('❌ User not found.');
   }
@@ -512,8 +748,14 @@ bot.action(/approve_user_(.+)/, async (ctx) => {
       status: 'active'
     });
     
-    await notification.notifyUser(userId, '✅ Your account has been approved by admin!');
-    await ctx.editMessageText(`✅ User ${user.fullName} has been approved.`);
+    await notification.notifyUserUnblocked(userId);
+    await ctx.editMessageText(`✅ User ${user.fullName} has been approved.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🚫 Block User', `block_user_${userId}`)],
+        [Markup.button.callback('🔙 Back to User', `view_user_${userId}`)],
+        [Markup.button.callback('🏠 User Menu', 'main_menu')]
+      ])
+    );
   } else {
     await ctx.answerCbQuery('❌ User not found.');
   }
@@ -536,13 +778,18 @@ bot.action(/reject_withdrawal_(.+)/, async (ctx) => {
   ctx.session.rejectingWithdrawal = ctx.match[1];
   await ctx.editMessageText(
     `❌ Rejecting withdrawal ${ctx.match[1]}\n\n` +
-    `Please send the rejection reason:`
+    `Please send the rejection reason:`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🚫 Cancel Rejection', 'admin_pending_withdrawals')],
+      [Markup.button.callback('🏠 User Menu', 'main_menu')]
+    ])
   );
 });
 
 // ==================== REFERRAL ACTION BUTTONS ====================
 bot.action('share_referral', async (ctx) => {
-  const user = ctx.userData;
+  await ctx.answerCbQuery('📤 Sharing referral link...');
+  const user = await database.getUser(ctx.from.id);
   if (!user) return;
   
   const referralLink = `https://t.me/${process.env.BOT_USERNAME}?start=${user.referralCode}`;
@@ -551,24 +798,22 @@ bot.action('share_referral', async (ctx) => {
     `👥 *Share Your Referral Link*\n\n` +
     `Your referral link:\n` +
     `${referralLink}\n\n` +
-    `Share this link with friends to earn ${CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL} ETB per successful referral!`,
+    `Share this link with friends to earn ${config.CONFIG.WITHDRAWAL.COMMISSION_PER_REFERRAL} ETB per successful referral!`,
     Markup.inlineKeyboard([
       [Markup.button.url('📤 Share on Telegram', `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=Join%20JU%20Tutorial%20Classes%20and%20earn%20money%20through%20referrals!`)],
-      [Markup.button.callback('🔙 Back', 'admin_back')]
+      [Markup.button.callback('🔙 Back to Referrals', 'show_referrals')],
+      [Markup.button.callback('🏠 Main Menu', 'main_menu')]
     ])
   );
 });
 
-bot.action('withdraw_telebirr', async (ctx) => {
-  await referral.handleTelebirrWithdrawal(ctx);
-});
-
-bot.action('withdraw_cbe', async (ctx) => {
-  await referral.handleCBEWithdrawal(ctx);
-});
-
 // ==================== SETTINGS BUTTON ====================
 bot.hears('⚙️ Settings', async (ctx) => {
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('👥 Contact Admin', 'contact_admin')],
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+  ]);
+
   await ctx.replyWithMarkdown(
     `⚙️ *Settings*\n\n` +
     `For any changes or support, please contact the admin.\n\n` +
@@ -576,12 +821,56 @@ bot.hears('⚙️ Settings', async (ctx) => {
     `• Profile updates\n` +
     `• Payment issues\n` +
     `• Account problems\n` +
-    `• General inquiries`
+    `• General inquiries`,
+    keyboard
+  );
+});
+
+bot.action('contact_admin', async (ctx) => {
+  await ctx.answerCbQuery('📞 Contacting admin...');
+  const adminIds = process.env.ADMIN_IDS?.split(',') || [];
+  if (adminIds.length > 0) {
+    await ctx.editMessageText(
+      `📞 *Contact Admin*\n\n` +
+      `Please message one of our admins directly:\n\n` +
+      adminIds.map(id => `👤 Admin: [Contact](tg://user?id=${id})`).join('\n'),
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Back to Settings', 'show_settings')],
+        [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+      ])
+    );
+  } else {
+    await ctx.editMessageText(
+      '❌ No admin contacts available at the moment.',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Back to Settings', 'show_settings')],
+        [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+      ])
+    );
+  }
+});
+
+bot.action('show_settings', async (ctx) => {
+  await ctx.answerCbQuery('⚙️ Loading settings...');
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('👥 Contact Admin', 'contact_admin')],
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+  ]);
+
+  await ctx.editMessageText(
+    `⚙️ *Settings*\n\n` +
+    `For any changes or support, please contact the admin.`,
+    keyboard
   );
 });
 
 // ==================== HELP COMMAND ====================
 bot.help((ctx) => {
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')],
+    [Markup.button.callback('👥 Contact Admin', 'contact_admin')]
+  ]);
+
   ctx.replyWithMarkdown(`
 🎓 *JU Tutorial Classes Bot Help*
 
@@ -607,13 +896,16 @@ bot.help((ctx) => {
 
 *Support:*
 Contact admin through the Settings menu.
-  `);
+  `, keyboard);
 });
 
 // ==================== ERROR HANDLER ====================
 bot.catch((err, ctx) => {
   console.error(`Error for ${ctx.updateType}:`, err);
-  ctx.reply('❌ An error occurred. Please try again or contact admin.');
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+  ]);
+  ctx.reply('❌ An error occurred. Please try again or contact admin.', keyboard);
 });
 
 // ==================== VERCEL HANDLER ====================
@@ -635,4 +927,4 @@ if (process.env.NODE_ENV === 'development') {
   
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
-      }
+}
